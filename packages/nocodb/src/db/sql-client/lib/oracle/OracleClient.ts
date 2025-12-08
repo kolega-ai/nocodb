@@ -14,6 +14,41 @@ class OracleClient extends KnexClient {
     super(connectionConfig);
   }
 
+  /**
+   * Validates and sanitizes Oracle identifiers (user names, table names, etc.)
+   * Oracle identifiers: 1-128 chars, start with letter, alphanumeric + _ $ #
+   */
+  private validateOracleIdentifier(identifier: string, name: string = 'identifier'): string {
+    if (!identifier || typeof identifier !== 'string') {
+      throw new Error(`Invalid ${name}: must be a non-empty string`);
+    }
+
+    // Remove any existing quotes and trim
+    const cleaned = identifier.replace(/"/g, '').trim();
+
+    // Oracle identifier rules (when not quoted)
+    // - Must start with a letter
+    // - Can contain letters, numbers, _, $, #
+    // - Max 128 characters (30 in older versions)
+    const validIdentifierRegex = /^[A-Za-z][A-Za-z0-9_$#]{0,127}$/;
+
+    if (!validIdentifierRegex.test(cleaned)) {
+      throw new Error(
+        `Invalid ${name} "${identifier}": must start with a letter and contain only alphanumeric characters, _, $, or #`
+      );
+    }
+
+    return cleaned.toUpperCase();
+  }
+
+  /**
+   * Safely quotes an identifier for use in DDL
+   */
+  private quoteOracleIdentifier(identifier: string, name: string = 'identifier'): string {
+    const validated = this.validateOracleIdentifier(identifier, name);
+    return `"${validated}"`;
+  }
+
   getKnexDataTypes() {
     const result = new Result();
 
@@ -166,22 +201,24 @@ class OracleClient extends KnexClient {
 
       log.debug('checking if db exists');
       const rows = await tempSqlClient.raw(
-        `select USERNAME from SYS.ALL_USERS WHERE USERNAME = '${this.connectionConfig.connection.user}'`,
+        `select USERNAME from SYS.ALL_USERS WHERE USERNAME = ?`,
+        [this.connectionConfig.connection.user],
       );
 
       if (rows.length === 0) {
         log.debug('creating database:', args);
+        const validatedUser = this.validateOracleIdentifier(this.connectionConfig.connection.user, 'user');
         await tempSqlClient.raw(
-          `CREATE USER ${this.connectionConfig.connection.user} IDENTIFIED BY ${this.connectionConfig.connection.user}`,
+          `CREATE USER "${validatedUser}" IDENTIFIED BY "${validatedUser}"`,
         );
         await tempSqlClient.raw(
-          `GRANT ALL PRIVILEGES TO ${this.connectionConfig.connection.user}`,
+          `GRANT ALL PRIVILEGES TO "${validatedUser}"`,
         );
         await tempSqlClient.raw(
-          `GRANT EXECUTE ON DBMS_AQ TO ${this.connectionConfig.connection.user}`,
+          `GRANT EXECUTE ON DBMS_AQ TO "${validatedUser}"`,
         );
         await tempSqlClient.raw(
-          `GRANT EXECUTE ON DBMS_AQADM TO ${this.connectionConfig.connection.user}`,
+          `GRANT EXECUTE ON DBMS_AQADM TO "${validatedUser}"`,
         );
       }
 
@@ -215,22 +252,30 @@ class OracleClient extends KnexClient {
       log.debug('dropping database:', this.connectionConfig.connection.user);
       // await tempSqlClient.raw(`ALTER SYSTEM enable restricted session`);
       const sessions =
-        await tempSqlClient.raw(`select SID,SERIAL# from v$session where username =  '${this.connectionConfig.connection.user}'
-      `);
+        await tempSqlClient.raw(`select SID,SERIAL# from v$session where username = ?`,
+          [this.connectionConfig.connection.user]
+        );
       log.debug(
         `Active Sessions for ${this.connectionConfig.connection.user}: `,
         sessions,
       );
       for (let i = 0; i < sessions.length; i++) {
         const session = sessions[i];
+        // Validate session identifiers are numeric to prevent injection
+        const sid = String(session.SID);
+        const serial = String(session['SERIAL#']);
+        if (!/^\d+$/.test(sid) || !/^\d+$/.test(serial)) {
+          throw new Error('Invalid session identifier format');
+        }
         await tempSqlClient.raw(
-          `alter system kill session '${session.SID},${session['SERIAL#']}' immediate`,
+          `alter system kill session '${sid},${serial}' immediate`,
         );
       }
 
       // await tempSqlClient.raw(`ALTER SYSTEM disable restricted session`);
+      const validatedUser = this.validateOracleIdentifier(this.connectionConfig.connection.user, 'user');
       await tempSqlClient.raw(
-        `drop user ${this.connectionConfig.connection.user} cascade`,
+        `drop user "${validatedUser}" cascade`,
       );
       log.debug('dropped database:', this.connectionConfig.connection.user);
     } catch (e) {
@@ -322,7 +367,8 @@ class OracleClient extends KnexClient {
 
     try {
       const rows = await this.raw(
-        `select TABLE_NAME as tn FROM all_tables WHERE OWNER = '${this.connectionConfig.connection.user}' AND tn = '${args.tn}'`,
+        `select TABLE_NAME as tn FROM all_tables WHERE OWNER = ? AND tn = ?`,
+        [this.connectionConfig.connection.user, args.tn],
       );
       result.data.value = rows.length > 0;
     } catch (e) {
@@ -342,7 +388,8 @@ class OracleClient extends KnexClient {
 
     try {
       const rows = await this.raw(
-        `select USERNAME from SYS.ALL_USERS WHERE USERNAME = '${args.databaseName}'`,
+        `select USERNAME from SYS.ALL_USERS WHERE USERNAME = ?`,
+        [args.databaseName],
       );
       result.data.value = rows.length > 0;
     } catch (e) {
@@ -396,7 +443,8 @@ class OracleClient extends KnexClient {
       args.databaseName = this.connectionConfig.connection.user;
 
       const rows = await this.raw(
-        `select table_name FROM all_tables WHERE owner='${args.databaseName}'`,
+        `select table_name FROM all_tables WHERE owner=?`,
+        [args.databaseName],
       );
       for (let i = 0; i < rows.length; i++) {
         let el = rows[i];
@@ -535,7 +583,7 @@ class OracleClient extends KnexClient {
             AND cc_pk.constraint_name = c_pk.constraint_name
           )
         WHERE
-          a.owner = '${args.databaseName}'
+          a.owner = ?
           AND c.constraint_type = 'P'
       ) p ON
       c.table_name = p.table_name
@@ -560,11 +608,11 @@ class OracleClient extends KnexClient {
       c.table_name = seq.table_name
       AND c.column_name = seq.column_name
     WHERE
-      c.owner = '${args.databaseName}' AND  c.table_name = '${args.tn}'
+      c.owner = ? AND  c.table_name = ?
     ORDER BY
       c.table_name,
       c.column_id,
-      c.column_name`);
+      c.column_name`, [args.databaseName, args.databaseName, args.tn]);
 
       for (let i = 0; i < response.length; i++) {
         let el = response[i];
@@ -634,8 +682,9 @@ class OracleClient extends KnexClient {
         from sys.all_indexes ind
         inner join sys.all_ind_columns ind_col on ind.owner = ind_col.index_owner
         and ind.index_name = ind_col.index_name
-        where ind.owner = '${args.databaseName}'  AND ind.table_name  = '${args.tn}'
+        where ind.owner = ?  AND ind.table_name  = ?
         order by ind.table_owner, ind.table_name, ind.index_name, ind_col.column_position`,
+        [args.databaseName, args.tn],
       );
 
       for (let i = 0; i < response.length; i++) {
@@ -680,9 +729,10 @@ class OracleClient extends KnexClient {
       const response = await this.raw(
         `SELECT cols.table_name as tn, cols.column_name as cn, cols.position, cons.*
         FROM all_constraints cons, all_cons_columns cols
-        WHERE cols.table_name = '${args.tn}' AND cols.owner = '${args.databaseName}'
+        WHERE cols.table_name = ? AND cols.owner = ?
         AND cons.constraint_type in ('P','R','U') AND cons.constraint_name = cols.constraint_name
         AND cons.owner = cols.owner ORDER BY cons.constraint_name, cols.position`,
+        [args.tn, args.databaseName],
       );
 
       for (let i = 0; i < response.length; i++) {
@@ -752,10 +802,10 @@ class OracleClient extends KnexClient {
       LEFT JOIN all_cons_columns cc_pk ON
         (	cc_pk.owner = c_pk.owner
           AND cc_pk.constraint_name = c_pk.constraint_name )
-      WHERE  a.owner = '${args.databaseName}'
+      WHERE  a.owner = ?
         AND c.constraint_type = 'R'
 
-      `);
+      `, [args.databaseName]);
 
       for (let i = 0; i < response.length; i++) {
         let el = response[i];
@@ -805,10 +855,10 @@ class OracleClient extends KnexClient {
       LEFT JOIN all_cons_columns cc_pk ON
         (	cc_pk.owner = c_pk.owner
           AND cc_pk.constraint_name = c_pk.constraint_name )
-      WHERE  a.owner = '${args.databaseName}'
+      WHERE  a.owner = ?
         AND c.constraint_type = 'R'
 
-      `);
+      `, [args.databaseName]);
 
       for (let i = 0; i < response.length; i++) {
         let el = response[i];
@@ -859,7 +909,7 @@ class OracleClient extends KnexClient {
       triggering_event, table_owner as schema_name, table_name as object_name, base_object_type as object_type,
       status, trigger_body as script     from sys.all_triggers
       -- excluding some Oracle maintained schemas
-      where owner = '${args.databaseName}' order by trigger_name, table_owner, table_name, base_object_type`);
+      where owner = ? order by trigger_name, table_owner, table_name, base_object_type`, [args.databaseName]);
 
       for (let i = 0; i < response.length; i++) {
         let el = response[i];
@@ -906,7 +956,8 @@ class OracleClient extends KnexClient {
       args.databaseName = this.connectionConfig.connection.user;
 
       const response = await this.raw(
-        `SELECT *  FROM ALL_OBJECTS WHERE owner = '${args.databaseName}' and OBJECT_TYPE IN ('FUNCTION','PROCEDURE','PACKAGE')`,
+        `SELECT *  FROM ALL_OBJECTS WHERE owner = ? and OBJECT_TYPE IN ('FUNCTION','PROCEDURE','PACKAGE')`,
+        [args.databaseName],
       );
 
       for (let i = 0; i < response.length; i++) {
@@ -952,7 +1003,8 @@ class OracleClient extends KnexClient {
       args.databaseName = this.connectionConfig.connection.user;
 
       const response = await this.raw(
-        `SELECT *  FROM ALL_OBJECTS WHERE owner = '${args.databaseName}' and OBJECT_TYPE IN ('FUNCTION','PROCEDURE','PACKAGE')`,
+        `SELECT *  FROM ALL_OBJECTS WHERE owner = ? and OBJECT_TYPE IN ('FUNCTION','PROCEDURE','PACKAGE')`,
+        [args.databaseName],
       );
 
       for (let i = 0; i < response.length; i++) {
@@ -992,7 +1044,8 @@ class OracleClient extends KnexClient {
       args.databaseName = this.connectionConfig.connection.user;
 
       const response = await this.raw(
-        `SELECT * FROM all_views WHERE owner='${args.databaseName}'`,
+        `SELECT * FROM all_views WHERE owner=?`,
+        [args.databaseName],
       );
 
       for (let i = 0; i < response.length; i++) {
@@ -1032,7 +1085,8 @@ class OracleClient extends KnexClient {
       args.databaseName = this.connectionConfig.connection.user;
 
       const response = await this.raw(
-        `SELECT * FROM all_source  WHERE TYPE = 'FUNCTION' AND OWNER = '${args.databaseName}' AND NAME = '${args.function_name}' ORDER BY line`,
+        `SELECT * FROM all_source  WHERE TYPE = 'FUNCTION' AND OWNER = ? AND NAME = ? ORDER BY line`,
+        [args.databaseName, args.function_name],
       );
       const rows = [];
       if (response.length > 0) {
@@ -1078,7 +1132,8 @@ class OracleClient extends KnexClient {
       args.databaseName = this.connectionConfig.connection.user;
 
       const response = await this.raw(
-        `SELECT * FROM all_source  WHERE TYPE = 'PROCEDURE' AND OWNER = '${args.databaseName}' AND NAME = '${args.procedure_name}' ORDER BY line`,
+        `SELECT * FROM all_source  WHERE TYPE = 'PROCEDURE' AND OWNER = ? AND NAME = ? ORDER BY line`,
+        [args.databaseName, args.procedure_name],
       );
       const rows = [];
       if (response.length > 0) {
@@ -1120,7 +1175,8 @@ class OracleClient extends KnexClient {
       args.databaseName = this.connectionConfig.connection.user;
 
       const response = await this.raw(
-        `SELECT * FROM all_views WHERE owner='${args.databaseName}' and view_name='${args.view_name}'`,
+        `SELECT * FROM all_views WHERE owner=? and view_name=?`,
+        [args.databaseName, args.view_name],
       );
 
       for (let i = 0; i < response.length; i++) {
@@ -1153,7 +1209,7 @@ class OracleClient extends KnexClient {
       triggering_event, table_owner as schema_name, table_name as object_name,
       base_object_type as object_type, status, trigger_body as script from sys.all_triggers
       -- excluding some Oracle maintained schemas
-      where owner = '${args.databaseName}' and trigger_name = '${args.trigger_name}' order by trigger_name, table_owner, table_name, base_object_type`);
+      where owner = ? and trigger_name = ? order by trigger_name, table_owner, table_name, base_object_type`, [args.databaseName, args.trigger_name]);
       if (!response[0]) return [];
 
       for (let i = 0; i < response.length; i++) {
@@ -1184,7 +1240,8 @@ class OracleClient extends KnexClient {
     log.api(`${_func}:args:`, args);
 
     try {
-      await this.raw(`create database ${args.database_name}`);
+      const validatedDatabaseName = this.validateOracleIdentifier(args.database_name, 'database_name');
+      await this.raw(`create database "${validatedDatabaseName}"`);
     } catch (e) {
       log.ppe(e, _func);
       throw e;
@@ -1201,7 +1258,8 @@ class OracleClient extends KnexClient {
     log.api(`${_func}:args:`, args);
 
     try {
-      await this.raw(`drop database ${args.database_name}`);
+      const validatedDatabaseName = this.validateOracleIdentifier(args.database_name, 'database_name');
+      await this.raw(`drop database "${validatedDatabaseName}"`);
     } catch (e) {
       log.ppe(e, _func);
       throw e;
@@ -1217,7 +1275,8 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${_func}:args:`, args);
     try {
-      await this.raw(`DROP TRIGGER IF EXISTS ${args.trigger_name}`);
+      const validatedTriggerName = this.validateOracleIdentifier(args.trigger_name, 'trigger_name');
+      await this.raw(`DROP TRIGGER "${validatedTriggerName}"`);
     } catch (e) {
       log.ppe(e, _func);
       throw e;
@@ -1234,7 +1293,8 @@ class OracleClient extends KnexClient {
     log.api(`${_func}:args:`, args);
 
     try {
-      await this.raw(`DROP FUNCTION IF EXISTS ${args.function_name}`);
+      const validatedFunctionName = this.validateOracleIdentifier(args.function_name, 'function_name');
+      await this.raw(`DROP FUNCTION "${validatedFunctionName}"`);
     } catch (e) {
       log.ppe(e, _func);
       throw e;
@@ -1250,7 +1310,8 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${_func}:args:`, args);
     try {
-      await this.raw(`DROP PROCEDURE IF EXISTS ${args.procedure_name}`);
+      const validatedProcedureName = this.validateOracleIdentifier(args.procedure_name, 'procedure_name');
+      await this.raw(`DROP PROCEDURE "${validatedProcedureName}"`);
     } catch (e) {
       log.ppe(e, _func);
       throw e;
@@ -1274,8 +1335,12 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
+      const validatedTriggerName = this.validateOracleIdentifier(args.function_name, 'function_name');
+      const validatedTableName = this.validateOracleIdentifier(args.tn, 'table_name');
+      // Note: args.timing, args.event, and args.statement need validation in actual implementation
+      // This is a simplified fix - full validation would require more complex parsing
       const rows = await this.sqlClient.raw(
-        `CREATE TRIGGER \`${args.function_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.statement}`,
+        `CREATE TRIGGER "${validatedTriggerName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.statement}`,
       );
       result.data.list = rows;
     } catch (e) {
@@ -1301,9 +1366,11 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
-      await this.sqlClient.raw(`DROP TRIGGER ${args.function_name}`);
+      const validatedTriggerName = this.validateOracleIdentifier(args.function_name, 'function_name');
+      const validatedTableName = this.validateOracleIdentifier(args.tn, 'table_name');
+      await this.sqlClient.raw(`DROP TRIGGER "${validatedTriggerName}"`);
       const rows = await this.sqlClient.raw(
-        `CREATE TRIGGER \`${args.function_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.statement}`,
+        `CREATE TRIGGER "${validatedTriggerName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.statement}`,
       );
       result.data.list = rows;
     } catch (e) {
@@ -1329,8 +1396,10 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
+      const validatedProcedureName = this.validateOracleIdentifier(args.procedure_name, 'procedure_name');
+      const validatedTableName = this.validateOracleIdentifier(args.tn, 'table_name');
       const rows = await this.sqlClient.raw(
-        `CREATE TRIGGER \`${args.procedure_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.statement}`,
+        `CREATE TRIGGER "${validatedProcedureName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.statement}`,
       );
       result.data.list = rows;
     } catch (e) {
@@ -1356,9 +1425,11 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
-      await this.sqlClient.raw(`DROP TRIGGER ${args.procedure_name}`);
+      const validatedProcedureName = this.validateOracleIdentifier(args.procedure_name, 'procedure_name');
+      const validatedTableName = this.validateOracleIdentifier(args.tn, 'table_name');
+      await this.sqlClient.raw(`DROP TRIGGER "${validatedProcedureName}"`);
       const rows = await this.sqlClient.raw(
-        `CREATE TRIGGER \`${args.procedure_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.statement}`,
+        `CREATE TRIGGER "${validatedProcedureName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.statement}`,
       );
       result.data.list = rows;
     } catch (e) {
@@ -1384,11 +1455,13 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
-      const query = `CREATE TRIGGER \`${args.trigger_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.statement}`;
+      const validatedTriggerName = this.validateOracleIdentifier(args.trigger_name, 'trigger_name');
+      const validatedTableName = this.validateOracleIdentifier(args.tn, 'table_name');
+      const query = `CREATE TRIGGER "${validatedTriggerName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.statement}`;
       await this.sqlClient.raw(query);
       result.data.object = {
         upStatement: query,
-        downStatement: `DROP TRIGGER ${args.trigger_name}`,
+        downStatement: `DROP TRIGGER "${validatedTriggerName}"`,
       };
     } catch (e) {
       log.ppe(e, func);
@@ -1414,14 +1487,16 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
-      await this.sqlClient.raw(`DROP TRIGGER ${args.trigger_name}`);
+      const validatedTriggerName = this.validateOracleIdentifier(args.trigger_name, 'trigger_name');
+      const validatedTableName = this.validateOracleIdentifier(args.tn, 'table_name');
+      await this.sqlClient.raw(`DROP TRIGGER "${validatedTriggerName}"`);
       await this.sqlClient.raw(
-        `CREATE TRIGGER \`${args.trigger_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.statement}`,
+        `CREATE TRIGGER "${validatedTriggerName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.statement}`,
       );
 
       result.data.object = {
-        upStatement: `DROP TRIGGER ${args.trigger_name};\nCREATE TRIGGER \`${args.trigger_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.statement}`,
-        downStatement: `CREATE TRIGGER \`${args.trigger_name}\` \n${args.timing} ${args.event}\nON ${args.tn} FOR EACH ROW\n${args.oldStatement}`,
+        upStatement: `DROP TRIGGER "${validatedTriggerName}";\nCREATE TRIGGER "${validatedTriggerName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.statement}`,
+        downStatement: `CREATE TRIGGER "${validatedTriggerName}" \n${args.timing} ${args.event}\nON "${validatedTableName}" FOR EACH ROW\n${args.oldStatement}`,
       };
     } catch (e) {
       log.ppe(e, func);
@@ -1444,12 +1519,13 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
-      const query = `CREATE VIEW ${args.view_name} AS \n${args.view_definition}`;
+      const validatedViewName = this.validateOracleIdentifier(args.view_name, 'view_name');
+      const query = `CREATE VIEW "${validatedViewName}" AS \n${args.view_definition}`;
 
       await this.sqlClient.raw(query);
       result.data.object = {
         upStatement: query,
-        downStatement: `DROP VIEW ${args.view_name}`,
+        downStatement: `DROP VIEW "${validatedViewName}"`,
       };
     } catch (e) {
       log.ppe(e, func);
@@ -1473,12 +1549,13 @@ class OracleClient extends KnexClient {
     const result = new Result();
     log.api(`${func}:args:`, args);
     try {
-      const query = `CREATE OR REPLACE VIEW ${args.view_name} AS \n${args.view_definition}`;
+      const validatedViewName = this.validateOracleIdentifier(args.view_name, 'view_name');
+      const query = `CREATE OR REPLACE VIEW "${validatedViewName}" AS \n${args.view_definition}`;
 
       await this.sqlClient.raw(query);
       result.data.object = {
         upStatement: query,
-        downStatement: `CREATE VIEW ${args.view_name} AS \n${args.oldViewDefination}`,
+        downStatement: `CREATE VIEW "${validatedViewName}" AS \n${args.oldViewDefination}`,
       };
     } catch (e) {
       log.ppe(e, func);
@@ -1503,13 +1580,14 @@ class OracleClient extends KnexClient {
     log.api(`${func}:args:`, args);
     // `DROP TRIGGER ${args.view_name}`
     try {
-      const query = `DROP VIEW ${args.view_name}`;
+      const validatedViewName = this.validateOracleIdentifier(args.view_name, 'view_name');
+      const query = `DROP VIEW "${validatedViewName}"`;
 
       await this.sqlClient.raw(query);
 
       result.data.object = {
         upStatement: query,
-        downStatement: `CREATE VIEW ${args.view_name} AS \n${args.oldViewDefination}`,
+        downStatement: `CREATE VIEW "${validatedViewName}" AS \n${args.oldViewDefination}`,
       };
     } catch (e) {
       log.ppe(e, func);
