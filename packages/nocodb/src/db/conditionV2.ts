@@ -16,6 +16,7 @@ import type { IBaseModelSqlV2 } from '~/db/IBaseModelSqlV2';
 import type { Column, Model } from '~/models';
 import { replaceDelimitedWithKeyValuePg } from '~/db/aggregations/pg';
 import { replaceDelimitedWithKeyValueSqlite3 } from '~/db/aggregations/sqlite3';
+import { replaceDelimitedWithKeyValueMySQL } from '~/db/aggregations/mysql';
 import generateLookupSelectQuery from '~/db/generateLookupSelectQuery';
 import { getRefColumnIfAlias } from '~/helpers';
 import { NcError } from '~/helpers/catchError';
@@ -300,13 +301,14 @@ const parseConditionV2 = async (
               })),
             })})`;
           } else {
-            finalStatement = users.reduce((acc, user) => {
-              const qb = knex.raw(`REPLACE(${acc}, ?, ?)`, [
-                user.id,
-                user.display_name || user.email,
-              ]);
-              return qb.toQuery();
-            }, knex.raw(`??`, [column.column_name]).toQuery());
+            finalStatement = `(${replaceDelimitedWithKeyValueMySQL({
+              knex,
+              needleColumn: column.column_name,
+              stack: users.map((user) => ({
+                key: user.id,
+                value: user.display_name || user.email,
+              })),
+            })})`;
           }
 
           let val = filter.value;

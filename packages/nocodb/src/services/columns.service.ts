@@ -87,6 +87,9 @@ import {
   User,
   View,
 } from '~/models';
+import { replaceDelimitedWithKeyValuePg } from '~/db/aggregations/pg';
+import { replaceDelimitedWithKeyValueSqlite3 } from '~/db/aggregations/sqlite3';
+import { replaceDelimitedWithKeyValueMySQL } from '~/db/aggregations/mysql';
 import Noco from '~/Noco';
 import { AppHooksService } from '~/services/app-hooks/app-hooks.service';
 import { IFormulaColumnTypeChanger } from '~/services/formula-column-type-changer.types';
@@ -1818,13 +1821,35 @@ export class ColumnsService implements IColumnsService {
         });
 
         // create nested replace statement for each user
-        const setStatement = baseUsers.reduce((acc, user) => {
-          const qb = sqlClient.knex.raw(`REPLACE(${acc}, ?, ?)`, [
-            user.id,
-            user.email,
-          ]);
-          return qb.toQuery();
-        }, sqlClient.knex.raw(`??`, [column.column_name]).toQuery());
+        let setStatement = '';
+        if (sqlClient.knex.clientType() === 'pg') {
+          setStatement = replaceDelimitedWithKeyValuePg({
+            knex: sqlClient.knex,
+            needleColumn: column.column_name,
+            stack: baseUsers.map((user) => ({
+              key: user.id,
+              value: user.email,
+            })),
+          });
+        } else if (sqlClient.knex.clientType() === 'sqlite3') {
+          setStatement = replaceDelimitedWithKeyValueSqlite3({
+            knex: sqlClient.knex,
+            needleColumn: column.column_name,
+            stack: baseUsers.map((user) => ({
+              key: user.id,
+              value: user.email,
+            })),
+          });
+        } else {
+          setStatement = replaceDelimitedWithKeyValueMySQL({
+            knex: sqlClient.knex,
+            needleColumn: column.column_name,
+            stack: baseUsers.map((user) => ({
+              key: user.id,
+              value: user.email,
+            })),
+          });
+        }
 
         await sqlClient.raw(`UPDATE ?? SET ?? = ${setStatement};`, [
           baseModel.getTnPath(table.table_name),

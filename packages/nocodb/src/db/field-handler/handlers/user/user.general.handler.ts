@@ -12,6 +12,9 @@ import { GenericFieldHandler } from '~/db/field-handler/handlers/generic';
 import { NcBaseErrorv2, NcError } from '~/helpers/catchError';
 import { extractProps } from '~/helpers/extractProps';
 import { BaseUser, type Column } from '~/models';
+import { replaceDelimitedWithKeyValuePg } from '~/db/aggregations/pg';
+import { replaceDelimitedWithKeyValueSqlite3 } from '~/db/aggregations/sqlite3';
+import { replaceDelimitedWithKeyValueMySQL } from '~/db/aggregations/mysql';
 
 export class UserGeneralHandler extends GenericFieldHandler {
   protected singleLineTextHandler: GenericFieldHandler =
@@ -278,9 +281,29 @@ export class UserGeneralHandler extends GenericFieldHandler {
     delimiter?: string;
   }) {
     const { knex, needleColumn, stack } = param;
-    return stack.reduce((acc, each) => {
-      const qb = knex.raw(`REPLACE(${acc}, ?, ?)`, [each.key, each.value]);
-      return qb.toQuery();
-    }, knex.raw(`??`, [needleColumn]).toQuery());
+    
+    // Use database-specific secure implementations
+    if (knex.clientType() === 'pg') {
+      return replaceDelimitedWithKeyValuePg({
+        knex,
+        needleColumn,
+        stack,
+        delimiter: param.delimiter,
+      });
+    } else if (knex.clientType() === 'sqlite3') {
+      return replaceDelimitedWithKeyValueSqlite3({
+        knex,
+        needleColumn,
+        stack,
+        delimiter: param.delimiter,
+      });
+    } else {
+      return replaceDelimitedWithKeyValueMySQL({
+        knex,
+        needleColumn,
+        stack,
+        delimiter: param.delimiter,
+      });
+    }
   }
 }
