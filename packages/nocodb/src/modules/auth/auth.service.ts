@@ -8,6 +8,7 @@ import Noco from '~/Noco';
 import { genJwt } from '~/services/users/helpers';
 import { UsersService } from '~/services/users/users.service';
 import { NcError } from '~/helpers/ncError';
+import { randomTokenString } from '~/helpers/stringHelpers';
 
 export class CreateUserDto {
   readonly username: string;
@@ -97,7 +98,7 @@ export class AuthService {
   ) {
     const roles: string = OrgUserRoles.CREATOR;
 
-    const token_version = ''; // randomTokenString();
+    const token_version = randomTokenString();
 
     return await this.usersService.insert(
       {
