@@ -15,6 +15,7 @@ import { DBErrorExtractor } from 'src/helpers/db-error/extractor';
 import genRollupSelectv2 from '../genRollupSelectv2';
 import { replaceDelimitedWithKeyValuePg } from '../aggregations/pg';
 import { replaceDelimitedWithKeyValueSqlite3 } from '../aggregations/sqlite3';
+import { replaceDelimitedWithKeyValueMySQL } from '../aggregations/mysql';
 import { lookupOrLtarBuilder } from './lookup-or-ltar-builder';
 import {
   binaryExpressionBuilder,
@@ -259,13 +260,14 @@ async function _formulaQueryBuilder(params: FormulaQueryBuilderBaseParams) {
                 })),
               })})`;
             } else {
-              finalStatement = baseUsers.reduce((acc, user) => {
-                const qb = knex.raw(`REPLACE(${acc}, ?, ?)`, [
-                  user.id,
-                  user.email,
-                ]);
-                return qb.toQuery();
-              }, knex.raw(`??`, [columnName]).toQuery());
+              finalStatement = `(${replaceDelimitedWithKeyValueMySQL({
+                knex,
+                needleColumn: columnName,
+                stack: baseUsers.map((user) => ({
+                  key: user.id,
+                  value: `${user.email}`,
+                })),
+              })})`;
             }
 
             return {

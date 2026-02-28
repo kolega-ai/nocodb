@@ -9,6 +9,9 @@ import genRollupSelectv2 from '~/db/genRollupSelectv2';
 import { sanitize } from '~/helpers/sqlSanitize';
 import generateLookupSelectQuery from '~/db/generateLookupSelectQuery';
 import { getRefColumnIfAlias } from '~/helpers';
+import { replaceDelimitedWithKeyValuePg } from '~/db/aggregations/pg';
+import { replaceDelimitedWithKeyValueSqlite3 } from '~/db/aggregations/sqlite3';
+import { replaceDelimitedWithKeyValueMySQL } from '~/db/aggregations/mysql';
 
 export default async function sortV2(
   baseModelSqlv2: BaseModelSqlv2,
@@ -166,13 +169,35 @@ export default async function sortV2(
         });
 
         // create nested replace statement for each user
-        const finalStatement = baseUsers.reduce((acc, user) => {
-          const qb = knex.raw(`REPLACE(${acc}, ?, ?)`, [
-            user.id,
-            user.display_name || user.email,
-          ]);
-          return qb.toQuery();
-        }, knex.raw(`??`, [column.column_name]).toQuery());
+        let finalStatement = '';
+        if (knex.clientType() === 'pg') {
+          finalStatement = replaceDelimitedWithKeyValuePg({
+            knex,
+            needleColumn: column.column_name,
+            stack: baseUsers.map((user) => ({
+              key: user.id,
+              value: user.display_name || user.email,
+            })),
+          });
+        } else if (knex.clientType() === 'sqlite3') {
+          finalStatement = replaceDelimitedWithKeyValueSqlite3({
+            knex,
+            needleColumn: column.column_name,
+            stack: baseUsers.map((user) => ({
+              key: user.id,
+              value: user.display_name || user.email,
+            })),
+          });
+        } else {
+          finalStatement = replaceDelimitedWithKeyValueMySQL({
+            knex,
+            needleColumn: column.column_name,
+            stack: baseUsers.map((user) => ({
+              key: user.id,
+              value: user.display_name || user.email,
+            })),
+          });
+        }
 
         qb.orderBy(
           sanitize(knex.raw(finalStatement)),
