@@ -8,6 +8,7 @@ import { useAgent } from 'request-filtering-agent';
 import { globStream } from 'glob';
 import type { IStorageAdapterV2, XcFile } from '~/types/nc-plugin';
 import { validateAndNormaliseLocalPath } from '~/helpers/attachmentHelpers';
+import { getToolDir } from '~/utils/nc-config';
 
 export default class Local implements IStorageAdapterV2 {
   name = 'Local';
@@ -127,22 +128,71 @@ export default class Local implements IStorageAdapterV2 {
   }
 
   public async scanFiles(globPattern: string) {
-    // Normalize the path separator
-    globPattern = globPattern.replace(/\//g, path.sep);
-
-    // remove all dots from the glob pattern
-    globPattern = globPattern.replace(/\./g, '');
-
-    // remove the leading slash
-    globPattern = globPattern.replace(/^\//, '');
-
-    // Ensure the pattern starts with 'nc/uploads/'
-    if (!globPattern.startsWith(path.join('nc', 'uploads'))) {
-      globPattern = path.join('nc', 'uploads', globPattern);
+    // Validate the input glob pattern to prevent path traversal
+    if (!globPattern || typeof globPattern !== 'string') {
+      throw new Error('Invalid glob pattern: must be a non-empty string');
     }
 
-    const stream = globStream(globPattern, {
+    // Check for dangerous patterns that could escape the base directory
+    if (globPattern.includes('..')) {
+      throw new Error('Invalid glob pattern: parent directory references not allowed');
+    }
+
+    if (globPattern.includes('\x00') || globPattern.includes('\0')) {
+      throw new Error('Invalid glob pattern: contains null byte');
+    }
+
+    // Validate the pattern doesn't contain absolute path indicators
+    if (path.isAbsolute(globPattern)) {
+      throw new Error('Invalid glob pattern: absolute paths not allowed');
+    }
+
+    // Platform-specific validation
+    if (process.platform === 'win32') {
+      if (/^[\\/]{2}/.test(globPattern) || /^[a-zA-Z]:/.test(globPattern)) {
+        throw new Error('Invalid glob pattern: Windows absolute paths not allowed');
+      }
+    }
+
+    // Normalize the pattern safely
+    let normalizedPattern = globPattern;
+    
+    // Remove leading slash
+    normalizedPattern = normalizedPattern.replace(/^\/+/, '');
+    
+    // Convert to forward slashes consistently (glob library expects this)
+    normalizedPattern = normalizedPattern.replace(/\\/g, '/');
+
+    // Ensure the pattern is within nc/uploads/ directory
+    if (!normalizedPattern.startsWith('nc/uploads/')) {
+      // If it doesn't start with nc/uploads/, prepend it
+      normalizedPattern = `nc/uploads/${normalizedPattern}`;
+    }
+
+    // Final validation: ensure the normalized pattern doesn't escape
+    const segments = normalizedPattern.split('/').filter(s => s !== '');
+    for (const segment of segments) {
+      if (segment === '..') {
+        throw new Error('Invalid glob pattern: contains parent directory reference after normalization');
+      }
+    }
+
+    // Get the tool directory and construct the full pattern
+    const toolDir = getToolDir();
+    const fullPattern = path.join(toolDir, normalizedPattern);
+
+    // Validate that the base path of the pattern is within our allowed directory
+    const basePath = path.dirname(fullPattern);
+    const allowedBase = path.resolve(toolDir, 'nc', 'uploads');
+    
+    if (!basePath.startsWith(allowedBase)) {
+      throw new Error('Invalid glob pattern: resolves outside allowed directory');
+    }
+
+    const stream = globStream(fullPattern, {
       nodir: true,
+      absolute: false,
+      cwd: toolDir,
     });
 
     return Readable.from(stream);
